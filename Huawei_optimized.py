@@ -1,13 +1,21 @@
 """
-华为UAV时变链路资源分配算法 - 优化版本
+华为UAV时变链路资源分配算法 - 优化版本 v2.0
 Optimized Time-varying Link Resource Allocation Algorithm
 
-关键优化点：
-1. 带宽预测与规划：提前规划高带宽时段
-2. 智能路径选择：综合考虑跳数、带宽、拥塞
-3. 着陆点稳定性：减少切换次数
-4. 负载均衡：避免热点拥塞
-5. 延迟优化：优先利用早期高带宽时段
+版本历史:
+- v1.0 (2025-10-25): 基础贪心算法 - 得分 7078.09
+- v2.0 (2025-10-26): 边际收益优化 - 得分 7119.11 (+41.02, +0.58%)
+
+v2.0 关键优化:
+1. 边际收益评分函数: 融合四项评分标准的数学建模
+2. 流量单位化: amount/total_size，避免大流垄断
+3. 时间衰减因子: 10/(t+10)，激励早期传输
+4. 指数距离惩罚: 2^(-0.1*dist)，强制近距离选择
+5. 着陆点切换追踪: 动态计算k值，减少切换
+
+算法核心思想:
+从「局部最优（最大化单次带宽）」转向「全局加权最优（最大化评分函数期望）」
+通过精确建模题目评分标准，让贪心决策与最终目标高度对齐。
 """
 
 import sys
@@ -59,6 +67,7 @@ class Flow:
         self.schedule = []
         self.last_landing_uav = None
         self.landing_change_count = 0
+        self.used_landing_positions = set()  # 记录使用过的不同着陆点
 
     def is_in_landing_area(self, x, y):
         """检查(x,y)是否在着陆区域"""
@@ -67,6 +76,10 @@ class Flow:
     def get_remaining(self):
         """获取剩余数据量"""
         return self.total_size - self.transmitted
+
+    def get_current_k(self):
+        """获取当前使用的不同着陆点数量k"""
+        return len(self.used_landing_positions)
 
 
 class OptimizedUAVNetwork:
@@ -99,8 +112,50 @@ class OptimizedUAVNetwork:
         """曼哈顿距离"""
         return abs(x1 - x2) + abs(y1 - y2)
 
+    def calculate_allocation_score(self, flow, landing_pos, t, amount):
+        """
+        计算分配的边际收益评分
+        按照题目四项评分标准的权重计算：
+        - U2G流量得分 (40%)
+        - 延迟得分 (20%)
+        - 距离得分 (30%)
+        - 着陆点得分 (10%)
+        """
+        # 计算距离
+        dist = self.manhattan_distance(flow.access_x, flow.access_y,
+                                       landing_pos[0], landing_pos[1])
+
+        # 1. U2G流量得分 (40%) - 归一化到总数据量
+        u2g_score = 0.4 * (amount / flow.total_size)
+
+        # 2. 延迟得分 (20%) - 时间衰减因子
+        # 公式: τ / (t_i + τ)，其中 τ = 10, t_i 是相对开始时间的延迟
+        tau = 10
+        delay_from_start = t - flow.t_start
+        delay_score = 0.2 * (tau / (delay_from_start + tau))
+
+        # 3. 距离得分 (30%) - 指数衰减
+        # 公式: 2^(-λ * h)，其中 λ = 0.1, h 是跳数（这里用曼哈顿距离近似）
+        alpha = 0.1
+        distance_score = 0.3 * (2 ** (-alpha * dist))
+
+        # 4. 着陆点得分 (10%) - 1/k，k是使用的不同着陆点数
+        # 如果选择新的着陆点，k会增加
+        current_k = flow.get_current_k()
+        if landing_pos in flow.used_landing_positions or current_k == 0:
+            # 继续使用已有着陆点，k不变
+            landing_score = 0.1 * (1.0 / max(1, current_k))
+        else:
+            # 使用新着陆点，k会+1
+            landing_score = 0.1 * (1.0 / (current_k + 1))
+
+        # 返回综合评分
+        total_score = u2g_score + delay_score + distance_score + landing_score
+
+        return total_score
+
     def find_best_landing_uavs_in_region(self, flow, t, top_k=3):
-        """找到着陆区域内的最佳K个UAV"""
+        """找到着陆区域内的最佳K个UAV - 使用边际收益评分"""
         candidates = []
 
         for x in range(flow.m1, flow.m2 + 1):
@@ -118,33 +173,32 @@ class OptimizedUAVNetwork:
                 if available_bw <= 0:
                     continue
 
-                # 距离因子（越近越好）
-                dist = self.manhattan_distance(flow.access_x, flow.access_y, x, y)
+                landing_pos = (x, y)
 
-                # 稳定性因子（与上次着陆点相同则加分）
-                stability_bonus = 0
-                if flow.last_landing_uav == (x, y):
-                    stability_bonus = 1000  # 大幅加分以保持稳定
+                # 计算可能的传输量（不超过剩余数据量）
+                potential_amount = min(available_bw, flow.get_remaining())
 
-                # 未来带宽潜力（查看接下来几个时刻的带宽）
+                # 使用新的边际收益评分函数
+                marginal_score = self.calculate_allocation_score(
+                    flow, landing_pos, t, potential_amount
+                )
+
+                # 额外考虑：未来带宽潜力（作为tie-breaker）
                 future_bw = 0
                 for future_t in range(t + 1, min(t + 5, self.T)):
                     future_bw += uav.get_bandwidth(future_t)
 
-                # 综合评分
-                score = (
-                    available_bw * 10 +           # 当前可用带宽
-                    future_bw * 2 +               # 未来带宽
-                    stability_bonus -             # 稳定性奖励
-                    dist * 5                      # 距离惩罚
-                )
+                # 最终评分：边际收益为主，未来带宽作为微调
+                final_score = marginal_score * 1000 + future_bw * 0.01
 
                 candidates.append({
-                    'pos': (x, y),
-                    'score': score,
+                    'pos': landing_pos,
+                    'score': final_score,
+                    'marginal_score': marginal_score,
                     'available_bw': available_bw,
-                    'dist': dist,
-                    'is_stable': flow.last_landing_uav == (x, y)
+                    'potential_amount': potential_amount,
+                    'dist': self.manhattan_distance(flow.access_x, flow.access_y, x, y),
+                    'is_stable': flow.last_landing_uav == landing_pos
                 })
 
         # 按评分排序，返回top K
@@ -165,19 +219,19 @@ class OptimizedUAVNetwork:
         return high_bw_periods
 
     def allocate_greedy_with_lookahead(self, flow, t):
-        """带前瞻的贪心分配"""
+        """带前瞻的贪心分配 - 使用边际收益评分"""
         if flow.transmitted >= flow.total_size or t < flow.t_start:
             return
 
         remaining = flow.get_remaining()
 
-        # 找到最佳着陆UAV候选
-        candidates = self.find_best_landing_uavs_in_region(flow, t, top_k=3)
+        # 找到最佳着陆UAV候选（使用边际收益评分）
+        candidates = self.find_best_landing_uavs_in_region(flow, t, top_k=5)
 
         if not candidates:
             return
 
-        # 选择第一个候选（评分最高）
+        # 选择评分最高的候选
         best_candidate = candidates[0]
         landing_pos = best_candidate['pos']
         available_bw = best_candidate['available_bw']
@@ -191,7 +245,10 @@ class OptimizedUAVNetwork:
             flow.transmitted += actual_transfer
             flow.schedule.append((t, landing_pos[0], landing_pos[1], actual_transfer))
 
-            # 更新着陆点
+            # 更新着陆点集合（用于计算k值）
+            flow.used_landing_positions.add(landing_pos)
+
+            # 更新最后使用的着陆点
             if flow.last_landing_uav != landing_pos:
                 if flow.last_landing_uav is not None:
                     flow.landing_change_count += 1
