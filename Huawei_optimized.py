@@ -1,5 +1,5 @@
 """
-华为UAV时变链路资源分配算法 - 优化版本 v2.1.3
+华为UAV时变链路资源分配算法 - 优化版本 v2.1.4
 Optimized Time-varying Link Resource Allocation Algorithm
 
 版本历史:
@@ -8,6 +8,12 @@ Optimized Time-varying Link Resource Allocation Algorithm
 - v2.1 (2025-10-26): 流调度顺序优化 - 超时
 - v2.1.2 (2025-10-26): 性能优化（采样估算）- 得分 7132.27 (+13.16, +0.18%)
 - v2.1.3 (2025-10-26): 精度提升优化 - 得分 7134.85 (+2.58, +0.04%)
+- v2.1.4 (2025-10-26): 权重微调优化 - 得分 7148.32 (+13.47, +0.19%)
+
+v2.1.4 权重微调优化:
+12. 距离衰减系数提升: alpha从0.1提升到0.15，强化近距离偏好
+13. 紧急度权重调整: 需求率×12(+20%), 稀缺性×60(+20%), 数据量×1.5(+50%)
+14. 候选过滤优化: 过滤传输量<剩余量1%的低效候选
 
 v2.1.3 精度提升优化:
 9. 增强采样精度: 大区域采样点从5个增加到9个（四角+四边中点+中心）
@@ -151,7 +157,7 @@ class OptimizedUAVNetwork:
 
         # 3. 距离得分 (30%) - 指数衰减
         # 公式: 2^(-λ * h)，其中 λ = 0.1, h 是跳数（这里用曼哈顿距离近似）
-        alpha = 0.1
+        alpha = 0.15  # 提升衰减系数（0.1 → 0.15），更强力惩罚远距离
         distance_score = 0.3 * (2 ** (-alpha * dist))
 
         # 4. 着陆点得分 (10%) - 1/k，k是使用的不同着陆点数
@@ -192,6 +198,10 @@ class OptimizedUAVNetwork:
 
                 # 计算可能的传输量（不超过剩余数据量）
                 potential_amount = min(available_bw, flow.get_remaining())
+
+                # 🔥 优化：过滤太小的传输量（低于剩余量的1%）
+                if potential_amount < flow.get_remaining() * 0.01:
+                    continue
 
                 # 使用新的边际收益评分函数
                 marginal_score = self.calculate_allocation_score(
@@ -368,11 +378,11 @@ class OptimizedUAVNetwork:
         # 3. 数据量因子（适度考虑）
         size_factor = remaining / 1000.0  # 归一化
 
-        # 综合紧急度评分
+        # 综合紧急度评分（微调权重）
         urgency = (
-            avg_demand_rate * 10.0 +      # 需求率权重最高
-            candidate_scarcity * 50.0 +   # 候选稀缺性
-            size_factor * 1.0             # 数据量（权重较低）
+            avg_demand_rate * 12.0 +      # 需求率权重（提升20%）
+            candidate_scarcity * 60.0 +   # 候选稀缺性（提升20%）
+            size_factor * 1.5             # 数据量（提升50%）
         )
 
         return urgency
