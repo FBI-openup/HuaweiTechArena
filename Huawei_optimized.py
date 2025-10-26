@@ -1,5 +1,5 @@
 """
-华为UAV时变链路资源分配算法 - 优化版本 v2.1.2
+华为UAV时变链路资源分配算法 - 优化版本 v2.1.3
 Optimized Time-varying Link Resource Allocation Algorithm
 
 版本历史:
@@ -7,6 +7,12 @@ Optimized Time-varying Link Resource Allocation Algorithm
 - v2.0 (2025-10-26): 边际收益优化 - 得分 7119.11 (+41.02, +0.58%)
 - v2.1 (2025-10-26): 流调度顺序优化 - 超时
 - v2.1.2 (2025-10-26): 性能优化（采样估算）- 得分 7132.27 (+13.16, +0.18%)
+- v2.1.3 (2025-10-26): 精度提升优化 - 得分 7134.85 (+2.58, +0.04%)
+
+v2.1.3 精度提升优化:
+9. 增强采样精度: 大区域采样点从5个增加到9个（四角+四边中点+中心）
+10. 提升精确计算阈值: 小区域阈值从9格提升到16格（≤4x4精确计算）
+11. 增加候选数量: Top-K从5增加到7，提升选择质量
 
 v2.1.2 性能优化:
 8. 采样式候选计数: 小区域(≤9格)精确计算，大区域采样5点估算，避免O(W×H)遍历
@@ -234,8 +240,8 @@ class OptimizedUAVNetwork:
 
         remaining = flow.get_remaining()
 
-        # 找到最佳着陆UAV候选（使用边际收益评分）
-        candidates = self.find_best_landing_uavs_in_region(flow, t, top_k=5)
+        # 找到最佳着陆UAV候选（使用边际收益评分，增加候选数到7）
+        candidates = self.find_best_landing_uavs_in_region(flow, t, top_k=7)
 
         if not candidates:
             return
@@ -306,10 +312,10 @@ class OptimizedUAVNetwork:
 
     def calculate_flow_urgency(self, flow, t):
         """
-        计算流在时刻t的紧急度评分（性能优化版：采样估算）
+        计算流在时刻t的紧急度评分（性能优化版v2：增强采样精度）
         综合考虑：
         1. 平均需求率（剩余量/剩余时间）- 越高越紧急
-        2. 可用候选数量（采样估算）- 越少越紧急
+        2. 可用候选数量（增强采样）- 越少越紧急
         3. 数据量 - 大流适当优先
         """
         remaining = flow.get_remaining()
@@ -318,26 +324,33 @@ class OptimizedUAVNetwork:
         # 1. 平均需求率（每秒需要传输的数据量）
         avg_demand_rate = remaining / remaining_time
 
-        # 2. 🔥 采样式候选计数（避免全遍历超时）
+        # 2. 🔥 增强采样式候选计数（提升精度）
         region_width = flow.m2 - flow.m1 + 1
         region_height = flow.n2 - flow.n1 + 1
         region_size = region_width * region_height
 
-        if region_size <= 9:  # 小区域（3x3以下）直接精确计算
+        if region_size <= 16:  # 小区域（≤4x4）直接精确计算
             available_candidates = sum(
                 1 for x in range(flow.m1, flow.m2 + 1)
                 for y in range(flow.n1, flow.n2 + 1)
                 if (x, y) in self.uavs and
                    self.uavs[(x, y)].get_bandwidth(t) - self.allocated_bandwidth[t][(x, y)] > 0
             )
-        else:  # 大区域采样估算
-            # 采样策略：四角 + 中心点（5个点）
+        else:  # 大区域采样估算（增加采样点到9个）
+            # 增强采样策略：四角 + 四边中点 + 中心点（9个点）
+            mid_x = (flow.m1 + flow.m2) // 2
+            mid_y = (flow.n1 + flow.n2) // 2
+
             sample_positions = [
-                (flow.m1, flow.n1),  # 左上
-                (flow.m2, flow.n2),  # 右下
-                (flow.m1, flow.n2),  # 左下
-                (flow.m2, flow.n1),  # 右上
-                ((flow.m1 + flow.m2) // 2, (flow.n1 + flow.n2) // 2)  # 中心
+                (flow.m1, flow.n1),      # 左上角
+                (flow.m2, flow.n2),      # 右下角
+                (flow.m1, flow.n2),      # 左下角
+                (flow.m2, flow.n1),      # 右上角
+                (mid_x, flow.n1),        # 上边中点
+                (mid_x, flow.n2),        # 下边中点
+                (flow.m1, mid_y),        # 左边中点
+                (flow.m2, mid_y),        # 右边中点
+                (mid_x, mid_y)           # 中心点
             ]
 
             sampled_count = sum(
@@ -346,8 +359,8 @@ class OptimizedUAVNetwork:
                    self.uavs[(x, y)].get_bandwidth(t) - self.allocated_bandwidth[t][(x, y)] > 0
             )
 
-            # 根据采样比例估算总数（至少保证1个候选）
-            available_candidates = max(1, int(sampled_count * region_size / 5))
+            # 根据采样比例估算总数（9点采样）
+            available_candidates = max(1, int(sampled_count * region_size / 9))
 
         # 候选少则更紧急（避免除零）
         candidate_scarcity = 1.0 / max(1, available_candidates)
